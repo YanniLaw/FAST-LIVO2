@@ -538,17 +538,19 @@ void LIVMapper::run()
   {
     ros::spinOnce();
     if (!sync_packages(LidarMeasures)) 
-    {
+    {  // 还差数据或时间没对齐，主循环空转等待
       rate.sleep();
       continue;
     }
+    // 这次循环就能触发一次估计
+    // 处理第一帧，初始化状态等
     handleFirstFrame();
 
-    processImu();
+    processImu(); // IMU 去畸变 + 前向传播
 
     // if (!p_imu->imu_time_init) continue;
 
-    stateEstimationAndMapping();
+    stateEstimationAndMapping(); // 根据 meas.lio_vio_flg 分派到 handleLIO()/handleVIO()
   }
   savePCD();
 }
@@ -769,13 +771,14 @@ void LIVMapper::livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg_i
 void LIVMapper::imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
 {
   if (!imu_en) return;
-
+  // 必须先接收到LiDAR数据
   if (last_timestamp_lidar < 0.0) return;
   // ROS_INFO("get imu at time: %.6f", msg_in->header.stamp.toSec());
   sensor_msgs::Imu::Ptr msg(new sensor_msgs::Imu(*msg_in));
+  // 补偿IMU时间偏移
   msg->header.stamp = ros::Time().fromSec(msg->header.stamp.toSec() - imu_time_offset);
   double timestamp = msg->header.stamp.toSec();
-
+  // 时间同步检查
   if (fabs(last_timestamp_lidar - timestamp) > 0.5 && (!ros_driver_fix_en))
   {
     ROS_WARN("IMU and LiDAR not synced! delta time: %lf .\n", last_timestamp_lidar - timestamp);
@@ -785,7 +788,7 @@ void LIVMapper::imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
   msg->header.stamp = ros::Time().fromSec(timestamp);
 
   mtx_buffer.lock();
-
+  // 检查IMU时间是否回退
   if (last_timestamp_imu > 0.0 && timestamp < last_timestamp_imu)
   {
     mtx_buffer.unlock();
@@ -808,7 +811,7 @@ void LIVMapper::imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
   imu_buffer.push_back(msg);
   // cout<<"got imu: "<<timestamp<<" imu size "<<imu_buffer.size()<<endl;
   mtx_buffer.unlock();
-  if (imu_prop_enable)
+  if (imu_prop_enable) // 开启IMU高频外推
   {
     mtx_buffer_imu_prop.lock();
     if (imu_prop_enable && !p_imu->imu_need_init) { prop_imu_buffer.push_back(*msg); }
@@ -847,6 +850,7 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
   double msg_header_time = msg->header.stamp.toSec() + img_time_offset;
   if (abs(msg_header_time - last_timestamp_img) < 0.001) return;
   ROS_INFO("Get image, its header time: %.6f", msg_header_time);
+  // 也是必须先接收到LiDAR数据
   if (last_timestamp_lidar < 0) return;
 
   if (msg_header_time < last_timestamp_img)
@@ -858,7 +862,7 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
   mtx_buffer.lock();
 
   double img_time_correct = msg_header_time; // last_timestamp_lidar + 0.105;
-
+  // 检查图像时间是否回退
   if (img_time_correct - last_timestamp_img < 0.02)
   {
     ROS_WARN("Image need Jumps: %.6f", img_time_correct);
@@ -881,16 +885,29 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
   sig_buffer.notify_all();
 }
 
+/**
+ * @brief 同步缓冲区中的 LiDAR、IMU 和图像数据，生成一组同步测量
+ * 判断“当前已缓冲的数据是否足够、且时间上对齐到可以触发一次状态估计”，
+ * 如果足够就按 SLAM 模式把 LiDAR / IMU / 图像裁剪打包成一组同步测量，并清掉已消费的缓冲数据。
+ * 这个函数是 FAST-LIVO2 多传感器时间同步 / 数据打包的核心调度器。它不负责状态估计，只回答一个问题：
+ * 现在缓冲里的 LiDAR / IMU / 图像数据，是否已经足够、且时间上对齐到可以触发一次状态估计？
+ * 如果能，就把它们裁剪打包成一组同步测量，并清掉已消费的数据。
+ * @param meas 
+ * @return true 
+ * @return false 
+ */
 bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
 {
+  // 检查每种已启用传感器是否都至少有一条缓冲数据
   if (lid_raw_data_buffer.empty() && lidar_en) return false;
   if (img_buffer.empty() && img_en) return false;
   if (imu_buffer.empty() && imu_en) return false;
-
+  // 不同的slam模式处理逻辑
   switch (slam_mode_)
   {
-  case ONLY_LIO:
+  case ONLY_LIO: // 一次调用 = 消费 1 帧 LiDAR + 截止到该帧末尾的 IMU，产出 1 个 LIO 测量组
   {
+    // Initialize the last LIO update time if it hasn't been set yet.
     if (meas.last_lio_update_time < 0.0) meas.last_lio_update_time = lid_header_time_buffer.front();
     if (!lidar_pushed)
     {
@@ -915,13 +932,13 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
     struct MeasureGroup m; // standard method to keep imu message.
 
     m.imu.clear();
-    m.lio_time = meas.lidar_frame_end_time;
+    m.lio_time = meas.lidar_frame_end_time; // 以激光雷达帧结束时间为lio时间
     mtx_buffer.lock();
     while (!imu_buffer.empty())
     {
       if (imu_buffer.front()->header.stamp.toSec() > meas.lidar_frame_end_time) break;
-      m.imu.push_back(imu_buffer.front());
-      imu_buffer.pop_front();
+      m.imu.push_back(imu_buffer.front()); // 搜集这段时间内的IMU数据
+      imu_buffer.pop_front(); // 移除已经处理过的IMU数据
     }
     lid_raw_data_buffer.pop_front();
     lid_header_time_buffer.pop_front();
@@ -936,7 +953,28 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
 
     break;
   }
-
+  /* 
+  LIVO 模式强制 LIO 与 VIO 交替执行：
+    先做一次 LIO 把位姿/地图更新到图像时刻，再立刻做一次 VIO 用图像再做一次优化。
+    二者共用一个 last_lio_update_time 锚点
+  LIVO 模式下，图像帧率（如 10~40 Hz）通常低于 LiDAR 帧率，
+    所以一次图像捕获时刻可能落在某帧 LiDAR scan 的中间，需要把一帧点云按时间"切开"，
+    前半部分属于上一次 LIO、后半部分留给下一次 —— 这正是 pcl_proc_cur / pcl_proc_next 存在的原因
+  状态机由 lio_vio_flg 控制，交替触发 LIO 和 VIO:
+                  —————— WAIT/VIO <————————————————————
+                  |                                   |
+        切出LIO帧  |  lio_vio_flg = LIO                |
+                  v                                   |
+              执行HandleLIO                           |
+                  |                                   |
+   下一次进入状态LIO|                                   |
+                  v                                   |
+              LIO分支: 打包图像 lio_vio_flg = VIO       |
+                  |                                   |
+                  v                                   |
+              执行HandleVIO ———————————————————————————
+  
+  */
   case LIVO:
   {
     /*** For LIVO mode, the time of LIO update is set to be the same as VIO, LIO
@@ -947,21 +985,23 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
     {
     // double img_capture_time = meas.lidar_frame_beg_time + exposure_time_init;
     case WAIT:
-    case VIO:
+    case VIO: // WAIT / VIO → 切出一帧 LIO
     {
       // printf("!!! meas.lio_vio_flg: %d \n", meas.lio_vio_flg);
+      // 以队首图像的实际曝光时刻作为本次 LIO 更新的目标时间
       double img_capture_time = img_time_buffer.front() + exposure_time_init;
       /*** has img topic, but img topic timestamp larger than lidar end time,
        * process lidar topic. After LIO update, the meas.lidar_frame_end_time
        * will be refresh. ***/
+      // 初始化时，设置上一次LIO更新的时间为激光雷达帧的起始时间
       if (meas.last_lio_update_time < 0.0) meas.last_lio_update_time = lid_header_time_buffer.front();
       // printf("[ Data Cut ] wait \n");
       // printf("[ Data Cut ] last_lio_update_time: %lf \n",
       // meas.last_lio_update_time);
-
+      // 计算当前"最新可用数据"
       double lid_newest_time = lid_header_time_buffer.back() + lid_raw_data_buffer.back()->points.back().curvature / double(1000);
       double imu_newest_time = imu_buffer.back()->header.stamp.toSec();
-
+      // 去掉过期的图像帧
       if (img_capture_time < meas.last_lio_update_time + 0.00001)
       {
         img_buffer.pop_front();
@@ -969,7 +1009,8 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
         ROS_ERROR("[ Data Cut ] Throw one image frame! \n");
         return false;
       }
-
+      // 检查图像帧是否超出最新的激光雷达或IMU时间，如果超出则等待新的数据
+      // 图像时刻对应的 LiDAR/IMU 还没到齐,等待未来数据
       if (img_capture_time > lid_newest_time || img_capture_time > imu_newest_time)
       {
         // ROS_ERROR("lost first camera frame");
@@ -983,9 +1024,9 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       // printf("[ Data Cut ] LIO \n");
       // printf("[ Data Cut ] img_capture_time: %lf \n", img_capture_time);
       m.imu.clear();
-      m.lio_time = img_capture_time;
+      m.lio_time = img_capture_time; // 设置LIO更新时间为图像捕获时间
       mtx_buffer.lock();
-      while (!imu_buffer.empty())
+      while (!imu_buffer.empty()) // 遍历IMU缓冲区，收集在LIO时间之前的IMU数据
       {
         if (imu_buffer.front()->header.stamp.toSec() > m.lio_time) break;
 
@@ -997,7 +1038,9 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       }
       mtx_buffer.unlock();
       sig_buffer.notify_all();
-
+      // ******** 切割点云（最关键部分）************** // 
+      // 先把上一轮的 pcl_proc_next 整体搬成 pcl_proc_cur（上一帧被"切到下帧"的点现在成为"当前帧"
+      // 并清空 pcl_proc_next
       *(meas.pcl_proc_cur) = *(meas.pcl_proc_next);
       PointCloudXYZI().swap(*meas.pcl_proc_next);
 
@@ -1006,24 +1049,26 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       meas.pcl_proc_cur->reserve(max_size);
       meas.pcl_proc_next->reserve(max_size);
       // deque<PointCloudXYZI::Ptr> lidar_buffer_tmp;
-
+      // 这样重写了每个点的 relative time 基准：
+      // 进 cur 的点相对 last_lio_update_time 计数，
+      // 进 next 的点相对本次 m.lio_time 计数，一帧 LiDAR 就在图像曝光时刻被精准"一分为二"
       while (!lid_raw_data_buffer.empty())
       {
         if (lid_header_time_buffer.front() > img_capture_time) break;
         auto pcl(lid_raw_data_buffer.front()->points);
         double frame_header_time(lid_header_time_buffer.front());
         float max_offs_time_ms = (m.lio_time - frame_header_time) * 1000.0f;
-
+        // 对每个点，用 curvature（帧内相对 ms）与该帧到 img_capture_time 的偏移比较
         for (int i = 0; i < pcl.size(); i++)
         {
           auto pt = pcl[i];
           if (pcl[i].curvature < max_offs_time_ms)
-          {
+          { // 属于 [last_lio_update_time, img_capture_time]，进 pcl_proc_cur
             pt.curvature += (frame_header_time - meas.last_lio_update_time) * 1000.0f;
             meas.pcl_proc_cur->points.push_back(pt);
           }
           else
-          {
+          { // 属于 [img_capture_time, ...]，留到下一次，进 pcl_proc_next
             pt.curvature += (frame_header_time - m.lio_time) * 1000.0f;
             meas.pcl_proc_next->points.push_back(pt);
           }
@@ -1033,7 +1078,9 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       }
 
       meas.measures.push_back(m);
-      meas.lio_vio_flg = LIO;
+      meas.lio_vio_flg = LIO; // 设置当前处理状态为 LIO
+      // 主循环触发 handleLIO()，把 _state 更新到 img_capture_time，
+      // 并更新 last_lio_update_time（在 VIO 处理里刷新）
       // meas.last_lio_update_time = m.lio_time;
       // printf("!!! meas.lio_vio_flg: %d \n", meas.lio_vio_flg);
       // printf("[ Data Cut ] pcl_proc_cur number: %d \n", meas.pcl_proc_cur
@@ -1042,8 +1089,8 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       return true;
     }
 
-    case LIO:
-    {
+    case LIO: // LIO → 切出一帧 VIO
+    { // 上一步 LIO 刚更新完，这一次进入该分支，专门打包图像
       double img_capture_time = img_time_buffer.front() + exposure_time_init;
       meas.lio_vio_flg = VIO;
       // printf("[ Data Cut ] VIO \n");
@@ -1051,8 +1098,8 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       double imu_time = imu_buffer.front()->header.stamp.toSec();
 
       struct MeasureGroup m;
-      m.vio_time = img_capture_time;
-      m.lio_time = meas.last_lio_update_time;
+      m.vio_time = img_capture_time; // VIO 的优化时刻
+      m.lio_time = meas.last_lio_update_time; // LIO 刚更新到的时刻，VIO 以此为传播基准
       m.img = img_buffer.front();
       mtx_buffer.lock();
       // while ((!imu_buffer.empty() && (imu_time < img_capture_time)))
@@ -1070,7 +1117,10 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       sig_buffer.notify_all();
       meas.measures.push_back(m);
       lidar_pushed = false; // after VIO update, the _lidar_frame_end_time will be refresh.
+      // （让下一次 WAIT/VIO 分支能重新切点云），返回 true → 主循环触发 handleVIO()
       // printf("[ Data Cut ] VIO process time: %lf \n", omp_get_wtime() - t0);
+      // VIO 分支里不消费 IMU（那段收集 IMU 的循环被注释掉了），
+      // 因为 handleVIO 只做光度/特征跟踪优化，IMU 传播由 processImu 与 LIO 帧完成
       return true;
     }
 

@@ -59,12 +59,13 @@ enum EKF_STATE
   LO = 3
 };
 
+// 一次同步后的一组测量
 struct MeasureGroup
 {
   double vio_time;
   double lio_time;
-  deque<sensor_msgs::Imu::ConstPtr> imu;
-  cv::Mat img;
+  deque<sensor_msgs::Imu::ConstPtr> imu; // 该时间段内的 IMU 数据
+  cv::Mat img; // 对应图像（VIO 用）
   MeasureGroup()
   {
     vio_time = 0.0;
@@ -72,17 +73,18 @@ struct MeasureGroup
   };
 };
 
+// 跨多帧累积的状态
 struct LidarMeasureGroup
 {
-  double lidar_frame_beg_time;
-  double lidar_frame_end_time;
-  double last_lio_update_time;
-  PointCloudXYZI::Ptr lidar;
-  PointCloudXYZI::Ptr pcl_proc_cur;
-  PointCloudXYZI::Ptr pcl_proc_next;
-  deque<struct MeasureGroup> measures;
-  EKF_STATE lio_vio_flg;
-  int lidar_scan_index_now;
+  double lidar_frame_beg_time;          // LIDAR frame begin time, default is -0.0
+  double lidar_frame_end_time;          // LIDAR frame end time, default is 0.0
+  double last_lio_update_time;          // 上一次 LIO 更新/传播到的时间, default is -1.0
+  PointCloudXYZI::Ptr lidar;            // Raw LIDAR point cloud
+  PointCloudXYZI::Ptr pcl_proc_cur;     // 已切到当前 LIO 帧的点云 // 切割点云（LIVO 关键）
+  PointCloudXYZI::Ptr pcl_proc_next;    // 被切到"下一帧"的点云    // 切割点云（LIVO 关键）
+  deque<struct MeasureGroup> measures;  // 打包好的测量组
+  EKF_STATE lio_vio_flg;                // 当前状态机状态, default is WAIT
+  int lidar_scan_index_now;             // Index of the current LIDAR scan, default is 0
 
   LidarMeasureGroup()
   {

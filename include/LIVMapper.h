@@ -70,8 +70,8 @@ public:
   
   string root_dir;
   string lid_topic, imu_topic, seq_name, img_topic;
-  V3D extT;
-  M3D extR;
+  V3D extT; // Extrinsic translation from LIDAR to IMU
+  M3D extR; // Extrinsic rotation from LIDAR to IMU
 
   int feats_down_size = 0, max_iterations = 0;
 
@@ -108,7 +108,7 @@ public:
   int img_en = 1, imu_int_frame = 3;
   bool normal_en = true;
   bool exposure_estimate_en = false;
-  double exposure_time_init = 0.0;
+  double exposure_time_init = 0.0; // 曝光时间
   bool inverse_composition_en = false;
   bool raycast_en = false;
   int lidar_en = 1;
@@ -124,10 +124,10 @@ public:
   deque<cv::Mat> img_buffer;
   deque<double> img_time_buffer;
   vector<pointWithVar> _pv_list;
-  vector<double> extrinT;
-  vector<double> extrinR;
-  vector<double> cameraextrinT;
-  vector<double> cameraextrinR;
+  vector<double> extrinT; // Extrinsic translation from camera to IMU
+  vector<double> extrinR; // Extrinsic rotation from camera to IMU
+  vector<double> cameraextrinT; // Extrinsic translation from camera to LIDAR
+  vector<double> cameraextrinR; // Extrinsic rotation from camera to LIDAR
   double IMG_POINT_COV;
 
   PointCloudXYZI::Ptr visual_sub_map;
@@ -141,11 +141,11 @@ public:
 
   ofstream fout_pre, fout_out, fout_visual_pos, fout_lidar_pos, fout_points;
 
-  pcl::VoxelGrid<PointType> downSizeFilterSurf;
+  pcl::VoxelGrid<PointType> downSizeFilterSurf; // Voxel grid filter for downsampling surf points
 
   V3D euler_cur;
 
-  LidarMeasureGroup LidarMeasures;
+  LidarMeasureGroup LidarMeasures; // 同步的激光雷达测量组
   StatesGroup _state;
   StatesGroup  state_propagat;
 
