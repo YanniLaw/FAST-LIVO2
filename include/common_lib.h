@@ -45,12 +45,14 @@ enum LID_TYPE
   PANDAR128 = 6,
   ROBOSENSE = 7
 };
+// 全局 SLAM 模式
 enum SLAM_MODE
 {
   ONLY_LO = 0,
   ONLY_LIO = 1,
   LIVO = 2
 };
+// LIVO 内部状态机
 enum EKF_STATE
 {
   WAIT = 0,
@@ -78,7 +80,7 @@ struct LidarMeasureGroup
 {
   double lidar_frame_beg_time;          // LIDAR frame begin time, default is -0.0
   double lidar_frame_end_time;          // LIDAR frame end time, default is 0.0
-  double last_lio_update_time;          // 上一次 LIO 更新/传播到的时间, default is -1.0
+  double last_lio_update_time;          // 上一次 LIO 更新/传播到的时间(锚点), default is -1.0
   PointCloudXYZI::Ptr lidar;            // Raw LIDAR point cloud
   PointCloudXYZI::Ptr pcl_proc_cur;     // 已切到当前 LIO 帧的点云 // 切割点云（LIVO 关键）
   PointCloudXYZI::Ptr pcl_proc_next;    // 被切到"下一帧"的点云    // 切割点云（LIVO 关键）

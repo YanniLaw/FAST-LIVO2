@@ -229,6 +229,7 @@ void LIVMapper::handleFirstFrame()
 
 void LIVMapper::gravityAlignment() 
 {
+  // 等待 IMU 初始化完成后再进行重力对齐
   if (!p_imu->imu_need_init && !gravity_align_finished) 
   {
     std::cout << "Gravity Alignment Starts" << std::endl;
@@ -245,10 +246,11 @@ void LIVMapper::gravityAlignment()
   }
 }
 
+// 处理 IMU 数据，进行状态预测和重力对齐
 void LIVMapper::processImu() 
 {
   // double t0 = omp_get_wtime();
-
+  // 处理 IMU 数据，进行状态传播和点云去畸变
   p_imu->Process2(LidarMeasures, _state, feats_undistort);
 
   if (gravity_align_en) gravityAlignment();
@@ -347,7 +349,7 @@ void LIVMapper::handleLIO()
   }
 
   double t0 = omp_get_wtime();
-
+  // 降采样
   downSizeFilterSurf.setInputCloud(feats_undistort);
   downSizeFilterSurf.filter(*feats_down_body);
   
@@ -355,6 +357,7 @@ void LIVMapper::handleLIO()
 
   feats_down_size = feats_down_body->points.size();
   voxelmap_manager->feats_down_body_ = feats_down_body;
+  // 转到传播后的世界坐标系
   transformLidar(_state.rot_end, _state.pos_end, feats_down_body, feats_down_world);
   voxelmap_manager->feats_down_world_ = feats_down_world;
   voxelmap_manager->feats_down_size_ = feats_down_size;
@@ -362,18 +365,18 @@ void LIVMapper::handleLIO()
   if (!lidar_map_inited) 
   {
     lidar_map_inited = true;
-    voxelmap_manager->BuildVoxelMap();
+    voxelmap_manager->BuildVoxelMap(); // 初始化voxel map
   }
 
   double t1 = omp_get_wtime();
-
+  // ESIKF 状态估计
   voxelmap_manager->StateEstimation(state_propagat);
   _state = voxelmap_manager->state_;
   _pv_list = voxelmap_manager->pv_list_;
 
   double t2 = omp_get_wtime();
 
-  if (imu_prop_enable) 
+  if (imu_prop_enable) // 无人机场景，把 EKF 更新完的状态与时刻保存
   {
     ekf_finish_once = true;
     latest_ekf_state = _state;
@@ -381,7 +384,7 @@ void LIVMapper::handleLIO()
     state_update_flg = true;
   }
 
-  if (pose_output_en) 
+  if (pose_output_en) // 轨迹记录
   {
     static bool pos_opend = false;
     static int ocount = 0;
@@ -403,15 +406,16 @@ void LIVMapper::handleLIO()
     evoFile << LidarMeasures.last_lio_update_time << " " << _state.pos_end[0] << " " << _state.pos_end[1] << " " << _state.pos_end[2] << " "
             << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << std::endl;
   }
-  
+  // 发布里程计信息
   euler_cur = RotMtoEuler(_state.rot_end);
   geoQuat = tf::createQuaternionMsgFromRollPitchYaw(euler_cur(0), euler_cur(1), euler_cur(2));
   publish_odometry(pubOdomAftMapped);
 
   double t3 = omp_get_wtime();
-
+  // 转到更新后的世界坐标系
   PointCloudXYZI::Ptr world_lidar(new PointCloudXYZI());
   transformLidar(_state.rot_end, _state.pos_end, feats_down_body, world_lidar);
+  // 地图更新：重投影 + 点不确定性传播
   for (size_t i = 0; i < world_lidar->points.size(); i++) 
   {
     voxelmap_manager->pv_list_[i].point_w << world_lidar->points[i].x, world_lidar->points[i].y, world_lidar->points[i].z;
@@ -426,12 +430,12 @@ void LIVMapper::handleLIO()
   _pv_list = voxelmap_manager->pv_list_;
   
   double t4 = omp_get_wtime();
-
+  // 滑窗裁剪
   if(voxelmap_manager->config_setting_.map_sliding_en)
   {
     voxelmap_manager->mapSliding();
   }
-  
+  // 构造当前帧世界点云，喂给视觉
   PointCloudXYZI::Ptr laserCloudFullRes(dense_map_en ? feats_undistort : feats_down_body);
   int size = laserCloudFullRes->points.size();
   PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
@@ -537,12 +541,12 @@ void LIVMapper::run()
   while (ros::ok()) 
   {
     ros::spinOnce();
+    // 这次循环就能触发一次估计
     if (!sync_packages(LidarMeasures)) 
     {  // 还差数据或时间没对齐，主循环空转等待
       rate.sleep();
       continue;
     }
-    // 这次循环就能触发一次估计
     // 处理第一帧，初始化状态等
     handleFirstFrame();
 
@@ -959,20 +963,35 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
     二者共用一个 last_lio_update_time 锚点
   LIVO 模式下，图像帧率（如 10~40 Hz）通常低于 LiDAR 帧率，
     所以一次图像捕获时刻可能落在某帧 LiDAR scan 的中间，需要把一帧点云按时间"切开"，
-    前半部分属于上一次 LIO、后半部分留给下一次 —— 这正是 pcl_proc_cur / pcl_proc_next 存在的原因
-  状态机由 lio_vio_flg 控制，交替触发 LIO 和 VIO:
-                  —————— WAIT/VIO <————————————————————
+    前半部分属于上一次 LIO、后半部分留给下一次，
+    二者共用 last_lio_update_time 作为锚点—— 这正是 pcl_proc_cur / pcl_proc_next 存在的原因
+
+  LIVO模式下内部状态机由 lio_vio_flg 控制，交替触发 LIO 和 VIO:
+                Start 
+                  |
+                  v
+                WAIT
+                  |                                 
+          切出LIO帧(点云切到图像时刻)  lio_vio_flg = LIO              
+                  | 
+                  v                                  
+                 LIO <————————————————————————————————
                   |                                   |
-        切出LIO帧  |  lio_vio_flg = LIO                |
                   v                                   |
-              执行HandleLIO                           |
+              执行HandleLIO                            |
                   |                                   |
-   下一次进入状态LIO|                                   |
+                  | 到这里完成一次LIO更新                |
+                  | 下一次进入状态VIO                   |
+                  | 打包图像 lio_vio_flg = VIO         |
                   v                                   |
-              LIO分支: 打包图像 lio_vio_flg = VIO       |
+                  VIO                                 |
                   |                                   |
                   v                                   |
-              执行HandleVIO ———————————————————————————
+              执行HandleVIO                            |
+                  | 到这里完成一次VIO更新                |
+                  | 下一次进入状态LIO                   |
+                  | 切出LIO帧, lio_vio_flg = LIO       |
+                   ————————————————————————————————————
   
   */
   case LIVO:
@@ -1057,8 +1076,12 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
         if (lid_header_time_buffer.front() > img_capture_time) break;
         auto pcl(lid_raw_data_buffer.front()->points);
         double frame_header_time(lid_header_time_buffer.front());
+        // 这里默认是lio_time大于frame_header_time的
         float max_offs_time_ms = (m.lio_time - frame_header_time) * 1000.0f;
         // 对每个点，用 curvature（帧内相对 ms）与该帧到 img_capture_time 的偏移比较
+        // 点云 curvature 在切割时被重标定，使 pcl_proc_cur 内点的时间基准与 last_lio_update_time 对齐，
+        // 从而 IMU 去畸变才能正确对每个点插值位姿
+        // IMU_Processing.cpp 中的 prop_end_time = flg==LIO ? meas.lio_time : meas.vio_time）
         for (int i = 0; i < pcl.size(); i++)
         {
           auto pt = pcl[i];
@@ -1079,7 +1102,7 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
 
       meas.measures.push_back(m);
       meas.lio_vio_flg = LIO; // 设置当前处理状态为 LIO
-      // 主循环触发 handleLIO()，把 _state 更新到 img_capture_time，
+      // 后续主循环触发 handleLIO()，把 _state 更新到 img_capture_time，
       // 并更新 last_lio_update_time（在 VIO 处理里刷新）
       // meas.last_lio_update_time = m.lio_time;
       // printf("!!! meas.lio_vio_flg: %d \n", meas.lio_vio_flg);
@@ -1088,13 +1111,17 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       // omp_get_wtime() - t0);
       return true;
     }
-
+    /*
+    关键点：LIO 与 VIO 使用同一个 last_lio_update_time 锚点，所以 VIO 帧几乎不额外传播 IMU，
+    只在图像时刻做一次基于特征/光度的优化，量测更新后锚点再前移。
+    这就是“LIO 先更新到图像时刻，VIO 立即在同一时刻再优化一次”的设计
+    */
     case LIO: // LIO → 切出一帧 VIO
     { // 上一步 LIO 刚更新完，这一次进入该分支，专门打包图像
       double img_capture_time = img_time_buffer.front() + exposure_time_init;
       meas.lio_vio_flg = VIO;
       // printf("[ Data Cut ] VIO \n");
-      meas.measures.clear();
+      meas.measures.clear(); // 清空之前的测量，准备打包新的 VIO 帧
       double imu_time = imu_buffer.front()->header.stamp.toSec();
 
       struct MeasureGroup m;
@@ -1102,6 +1129,7 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       m.lio_time = meas.last_lio_update_time; // LIO 刚更新到的时刻，VIO 以此为传播基准
       m.img = img_buffer.front();
       mtx_buffer.lock();
+      // 不消费IMU ，因为 VIO 的 IMU 传播由 processImu/LIO 帧负责
       // while ((!imu_buffer.empty() && (imu_time < img_capture_time)))
       // {
       //   imu_time = imu_buffer.front()->header.stamp.toSec();
