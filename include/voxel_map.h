@@ -32,23 +32,24 @@ which is included as part of this source code package.
 
 static int voxel_plane_id = 0;
 
+// 体素地图配置结构体，用于存储体素地图的各种参数设置
 typedef struct VoxelMapConfig
 {
-  double max_voxel_size_;
-  int max_layer_;
-  int max_iterations_;
-  std::vector<int> layer_init_num_;
-  int max_points_num_;
-  double planner_threshold_;
-  double beam_err_;
-  double dept_err_;
-  double sigma_num_;
-  bool is_pub_plane_map_;
+  double max_voxel_size_;             // 根体素大小
+  int max_layer_;                     // 八叉树最大层数
+  int max_iterations_;                // 最大迭代次数
+  std::vector<int> layer_init_num_;   // 每一层的初始点数
+  int max_points_num_;                // 每个体素的最大点数
+  double planner_threshold_;          // 平面拟合判定阈值
+  double beam_err_;                   // 激光束误差
+  double dept_err_;                   // 深度误差
+  double sigma_num_;                  // 不确定性倍数
+  bool is_pub_plane_map_;             // 是否发布平面地图
 
   // config of local map sliding
-  double sliding_thresh;
-  bool map_sliding_en;
-  int half_map_size;
+  double sliding_thresh;              // 滑动阈值
+  bool map_sliding_en;                // 是否启用地图滑动
+  int half_map_size;                  // 地图半尺寸
 } VoxelMapConfig;
 
 typedef struct PointToPlane
@@ -66,24 +67,27 @@ typedef struct PointToPlane
   float dis_to_plane_;
 } PointToPlane;
 
+// 体素平面结构体，用于存储体素平面的各种属性
+// 平面参数可近似看成 π = [n; q]，其中 n 为法向量 normal，q 为平面中心点 center
+// 所以 plane_var_ 为∑_π = [∑nn  ∑nq; ∑qn  ∑qq]
 typedef struct VoxelPlane
 {
-  Eigen::Vector3d center_;
-  Eigen::Vector3d normal_;
-  Eigen::Vector3d y_normal_;
-  Eigen::Vector3d x_normal_;
-  Eigen::Matrix3d covariance_;
-  Eigen::Matrix<double, 6, 6> plane_var_;
-  float radius_ = 0;
-  float min_eigen_value_ = 1;
-  float mid_eigen_value_ = 1;
-  float max_eigen_value_ = 1;
-  float d_ = 0;
-  int points_size_ = 0;
-  bool is_plane_ = false;
-  bool is_init_ = false;
-  int id_ = 0;
-  bool is_update_ = false;
+  Eigen::Vector3d center_;      // 八叉树体素平面中心点
+  Eigen::Vector3d normal_;      // 法向量
+  Eigen::Vector3d y_normal_;    // y方向法向量
+  Eigen::Vector3d x_normal_;    // x方向法向量
+  Eigen::Matrix3d covariance_;  // 协方差矩阵
+  Eigen::Matrix<double, 6, 6> plane_var_; // 平面参数的协方差矩阵 
+  float radius_ = 0;  // 平面的半径
+  float min_eigen_value_ = 1;   // 最小特征值
+  float mid_eigen_value_ = 1;   // 中间特征值
+  float max_eigen_value_ = 1;   // 最大特征值
+  float d_ = 0;                  // 平面方程中的d参数
+  int points_size_ = 0;          // 八叉树节点中点的数量
+  bool is_plane_ = false;        // 是否为平面
+  bool is_init_ = false;         // 是否初始化
+  int id_ = 0;                   // 平面ID
+  bool is_update_ = false;       // 是否更新
   VoxelPlane()
   {
     plane_var_ = Eigen::Matrix<double, 6, 6>::Zero();
@@ -96,7 +100,7 @@ typedef struct VoxelPlane
 class VOXEL_LOCATION
 {
 public:
-  int64_t x, y, z;
+  int64_t x, y, z; // 根体素在三维空间中的整数坐标
 
   VOXEL_LOCATION(int64_t vx = 0, int64_t vy = 0, int64_t vz = 0) : x(vx), y(vy), z(vz) {}
 
@@ -131,22 +135,24 @@ class VoxelOctoTree
 
 public:
   VoxelOctoTree() = default;
-  std::vector<pointWithVar> temp_points_;
+  std::vector<pointWithVar> temp_points_; // 八叉树节点的临时点云，用于存储当前节点积累的点
   VoxelPlane *plane_ptr_;
-  int layer_;
-  int octo_state_; // 0 is end of tree, 1 is not
-  VoxelOctoTree *leaves_[8];
-  double voxel_center_[3]; // x, y, z
-  std::vector<int> layer_init_num_;
-  float quater_length_;
-  float planer_threshold_;
-  int points_size_threshold_;
-  int update_size_threshold_;
-  int max_points_num_;
-  int max_layer_;
-  int new_points_;
-  bool init_octo_;
-  bool update_enable_;
+  int layer_; // 当前八叉树节点所在的层级
+  int octo_state_; // 八叉树节点状态，0表示八叉树的末端，1表示不是末端
+  VoxelOctoTree *leaves_[8]; // 八叉树节点的子节点指针数组，最多有8个子节点
+  double voxel_center_[3];   // 八叉树节点的中心坐标 x, y, z
+  std::vector<int> layer_init_num_; // 每一层八叉树初始化的点数(每一层至少积累多少点以后，才开始判断这个节点是否能够形成平面)
+  // 这里是为了方便计算后面的child center offset, 即每个子节点的中心相对于父节点的偏移量可以通过 quater_length_ 来计算
+  // 假设根体素 size = s , 那么一个child的size为 s/2 , child center 距离 parent center 的偏移量为 s/4，即 quater_length_
+  float quater_length_; // 八叉树节点的四分之一边长，用于判断子节点的空间范围
+  float planer_threshold_;  // 八叉树节点的平面拟合阈值
+  int points_size_threshold_; // 八叉树节点的点数阈值，当节点积累的点数达到该阈值时，才开始判断是否形成平面
+  int update_size_threshold_; // 八叉树节点的更新点数阈值，当节点积累的更新点数达到该阈值时，才触发更新
+  int max_points_num_;  // 八叉树节点允许的最大点数
+  int max_layer_;       // 最大八叉树层数  每一层的voxel大小与层数有关 s_l = s_0 / 2^l
+  int new_points_;      // 八叉树节点中新加入的点数
+  bool init_octo_;      // 八叉树节点是否已经初始化
+  bool update_enable_;  // 八叉树节点是否允许更新
 
   VoxelOctoTree(int max_layer, int layer, int points_size_threshold, int max_points_num, float planer_threshold)
       : max_layer_(max_layer), layer_(layer), points_size_threshold_(points_size_threshold), max_points_num_(max_points_num),
@@ -191,7 +197,7 @@ public:
   VoxelMapConfig config_setting_;
   int current_frame_id_ = 0;
   ros::Publisher voxel_map_pub_;
-  std::unordered_map<VOXEL_LOCATION, VoxelOctoTree *> voxel_map_;
+  std::unordered_map<VOXEL_LOCATION, VoxelOctoTree *> voxel_map_; // 八叉树体素地图，键为体素位置，值为对应的八叉树节点指针
 
   PointCloudXYZI::Ptr feats_undistort_;
   PointCloudXYZI::Ptr feats_down_body_;

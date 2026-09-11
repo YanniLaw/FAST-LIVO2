@@ -102,7 +102,7 @@ struct LidarMeasureGroup
     last_lio_update_time = -1.0;
   };
 };
-
+// 点云中带有不确定性的点结构体
 typedef struct pointWithVar
 {
   Eigen::Vector3d point_b;     // point in the lidar body frame
@@ -110,7 +110,7 @@ typedef struct pointWithVar
   Eigen::Vector3d point_w;     // point in the world frame
   Eigen::Matrix3d var_nostate; // the var removed the state covarience
   Eigen::Matrix3d body_var;
-  Eigen::Matrix3d var;
+  Eigen::Matrix3d var; // the full covariance including the state uncertainty
   Eigen::Matrix3d point_crossmat;
   Eigen::Vector3d normal;
   pointWithVar()
@@ -126,7 +126,7 @@ typedef struct pointWithVar
   };
 } pointWithVar;
 
-
+// 一组状态的结构体，用于存储 LIO 的状态信息
 struct StatesGroup
 {
   StatesGroup()

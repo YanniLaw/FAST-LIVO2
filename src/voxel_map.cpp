@@ -12,6 +12,17 @@ which is included as part of this source code package.
 
 #include "voxel_map.h"
 
+/**
+ * @brief 计算激光点在机体坐标系下的协方差矩阵，考虑激光测距误差和角度误差
+ * 测量不是一个完美确定的点，而是 p ~ N(p, cov) 的高斯分布。其中误差主要来源于: 
+ * range /depth error 和 beam angular error
+ * calcBodyCov 依据激光雷达的距离分辨率 dept_err_ 和角度分辨率 beam_err_，
+ * 在机体坐标系里估计每个点的测量噪声协方差（径向为测距误差、切向为角度误差）
+ * @param pb  激光点在机体坐标系下的坐标
+ * @param range_inc 激光测距误差
+ * @param degree_inc 激光角度误差
+ * @param cov  输出的协方差矩阵
+ */
 void calcBodyCov(Eigen::Vector3d &pb, const float range_inc, const float degree_inc, Eigen::Matrix3d &cov)
 {
   if (pb[2] == 0) pb[2] = 0.0001;
@@ -52,6 +63,17 @@ void loadVoxelConfig(ros::NodeHandle &nh, VoxelMapConfig &voxel_config)
   nh.param<double>("local_map/sliding_thresh", voxel_config.sliding_thresh, 8);
 }
 
+/**
+ * @brief 初始化八叉树节点的平面信息
+ * 给定八叉树节点里积累的一批世界系点（每个点自带协方差 var），用 PCA（协方差矩阵特征分解） 
+ * 判断它们能否构成一个平面；如果能，就顺便用误差传播公式算出平面参数自身的协方差 plane_var
+ * 调用点: 
+ * 1. init_octo_tree() —— 初始化建图阶段，点数超过阈值时尝试拟合平面;
+ * 2. cut_octo_tree() —— 父节点不是平面、递归细分到子节点后再对子节点拟合;
+ * 3. UpdateOctoTree() —— 地图更新阶段，新点积累超过 update_size_threshold_ 时重新拟合.
+ * @param points  八叉树节点积累的点云
+ * @param plane  八叉树节点的平面信息结构体
+ */
 void VoxelOctoTree::init_plane(const std::vector<pointWithVar> &points, VoxelPlane *plane)
 {
   plane->plane_var_ = Eigen::Matrix<double, 6, 6>::Zero();
@@ -65,24 +87,32 @@ void VoxelOctoTree::init_plane(const std::vector<pointWithVar> &points, VoxelPla
     plane->covariance_ += pv.point_w * pv.point_w.transpose();
     plane->center_ += pv.point_w;
   }
+  // 计算该八叉树体素中p oints 的均值
   plane->center_ = plane->center_ / plane->points_size_;
+  // 计算八叉树体素中 points 协方差矩阵 注意用的是无偏置的1/N
   plane->covariance_ = plane->covariance_ / plane->points_size_ - plane->center_ * plane->center_.transpose();
+  // 对协方差矩阵进行特征分解，得到特征值和特征向量
   Eigen::EigenSolver<Eigen::Matrix3d> es(plane->covariance_);
   Eigen::Matrix3cd evecs = es.eigenvectors();
   Eigen::Vector3cd evals = es.eigenvalues();
   Eigen::Vector3d evalsReal;
-  evalsReal = evals.real();
+  evalsReal = evals.real(); // EigenSolver计算的特征值和特征向量是复数
   Eigen::Matrix3f::Index evalsMin, evalsMax;
   evalsReal.rowwise().sum().minCoeff(&evalsMin);
   evalsReal.rowwise().sum().maxCoeff(&evalsMax);
+  // 小技巧： 因为下表集合是 {0, 1, 2}，三者之和恒为3
   int evalsMid = 3 - evalsMin - evalsMax;
-  Eigen::Vector3d evecMin = evecs.real().col(evalsMin);
-  Eigen::Vector3d evecMid = evecs.real().col(evalsMid);
-  Eigen::Vector3d evecMax = evecs.real().col(evalsMax);
+  Eigen::Vector3d evecMin = evecs.real().col(evalsMin); // 法向量
+  Eigen::Vector3d evecMid = evecs.real().col(evalsMid); // 切平面次主轴
+  Eigen::Vector3d evecMax = evecs.real().col(evalsMax); // 切平面内主轴
   Eigen::Matrix3d J_Q;
   J_Q << 1.0 / plane->points_size_, 0, 0, 0, 1.0 / plane->points_size_, 0, 0, 0, 1.0 / plane->points_size_;
   // && evalsReal(evalsMid) > 0.05
   //&& evalsReal(evalsMid) > 0.01
+  /*
+  这是整个函数最值得理解的部分。目标：每个点 pi有一个微扰 δpi，求它对平面参数的影响。
+  平面参数取向量6维 [n; c]，其中 n 为法向量 normal，q 为平面中心点 center
+  */
   if (evalsReal(evalsMin) < planer_threshold_)
   {
     for (int i = 0; i < points.size(); i++)
@@ -134,37 +164,41 @@ void VoxelOctoTree::init_plane(const std::vector<pointWithVar> &points, VoxelPla
   }
 }
 
+// 初始化八叉树
+// 它负责决定当前这个 voxel 节点，是“直接作为平面叶子节点使用”，还是“继续切成 8 个子 voxel”
 void VoxelOctoTree::init_octo_tree()
 {
+  // 如果积累的点数超过阈值，则尝试拟合平面
   if (temp_points_.size() > points_size_threshold_)
   {
     init_plane(temp_points_, plane_ptr_);
-    if (plane_ptr_->is_plane_ == true)
+    if (plane_ptr_->is_plane_ == true) // 能构成平面
     {
-      octo_state_ = 0;
+      octo_state_ = 0; // 本节点成为叶子节点
       // new added
+      // 如果这个 voxel 已经是稳定平面，而且样本已经很多，就不再持续保存所有历史点
       if (temp_points_.size() > max_points_num_)
       {
-        update_enable_ = false;
-        std::vector<pointWithVar>().swap(temp_points_);
+        update_enable_ = false; // 这个plane已经很成熟，冻结，不再接受更新
+        std::vector<pointWithVar>().swap(temp_points_); // 真正释放内存
         new_points_ = 0;
       }
     }
-    else
+    else // 不能构成平面
     {
-      octo_state_ = 1;
-      cut_octo_tree();
+      octo_state_ = 1; // 本节点成为内部节点，还可继续往下细分
+      cut_octo_tree(); // 细分到 8 个子节点
     }
-    init_octo_ = true;
-    new_points_ = 0;
+    init_octo_ = true; // 标记已完成初始化
+    new_points_ = 0;   // 清空新增点计数
   }
 }
 
 void VoxelOctoTree::cut_octo_tree()
 {
-  if (layer_ >= max_layer_)
+  if (layer_ >= max_layer_) // 最多只能细分多少层
   {
-    octo_state_ = 0;
+    octo_state_ = 0; // 达到最大层数，当前节点成为叶子节点
     return;
   }
   for (size_t i = 0; i < temp_points_.size(); i++)
@@ -529,14 +563,23 @@ void VoxelMapManager::TransformLidar(const Eigen::Matrix3d rot, const Eigen::Vec
   }
 }
 
+/** 
+ * @brief  把一帧降采样后的世界系点云写入体素地图
+ * BuildVoxelMap() 自己并不真正完成复杂的平面拟合和 octree 递归，
+ * 一句话概括就是: 
+ * 把当前第一批已经变换到世界坐标系的降采样 LiDAR 点，附上每个点的不确定性，
+ * 然后按大 voxel 做哈希分桶；每个 voxel 创建一个 VoxelOctoTree 根节点，
+ * 最后统一调用 init_octo_tree()，把每个 voxel 递归判断为“平面”或者继续八叉树细分。
+ */
 void VoxelMapManager::BuildVoxelMap()
 {
-  float voxel_size = config_setting_.max_voxel_size_;
+  // 读取voxel 参数
+  float voxel_size = config_setting_.max_voxel_size_; // 根体素尺寸大小，即最外层 hash voxel 的边长
   float planer_threshold = config_setting_.planner_threshold_;
   int max_layer = config_setting_.max_layer_;
   int max_points_num = config_setting_.max_points_num_;
   std::vector<int> layer_init_num = config_setting_.layer_init_num_;
-
+  // 为每帧点构造带协方差的数据pointWithVar
   std::vector<pointWithVar> input_points;
 
   for (size_t i = 0; i < feats_down_world_->size(); i++)
@@ -545,15 +588,31 @@ void VoxelMapManager::BuildVoxelMap()
     pv.point_w << feats_down_world_->points[i].x, feats_down_world_->points[i].y, feats_down_world_->points[i].z;
     V3D point_this(feats_down_body_->points[i].x, feats_down_body_->points[i].y, feats_down_body_->points[i].z);
     M3D var;
+    // 从激光点的原始测量开始构造测量协方差矩阵
+    // 它从地图初始化阶段开始，就不是把点当“确定的位置”，而是把点当一个带 uncertainty 的空间观测
     calcBodyCov(point_this, config_setting_.dept_err_, config_setting_.beam_err_, var);
     M3D point_crossmat;
     point_crossmat << SKEW_SYM_MATRX(point_this);
+    // 把点 covariance 转到世界系
+    // 转换到世界系时额外叠加了两项：姿态不确定度导致的误差（用叉乘矩阵 (-point_crossmat) 乘旋转协方差）
+    // 以及位置不确定度（state_.cov.block<3,3>(3,3)）。
+    // 这样存进地图的每个点都自带统计意义上的噪声信息，后面拟合平面计算 plane_var_ 时就会用到。
+    // 它实际上是把几类不确定性叠加起来: 
+    // ∑p_w = R*∑lidar*R^T + J_R*∑R*J_R^T + ∑t
+    // 其中:
+    // R 为世界系到机体系的旋转矩阵, ∑lidar 为激光点在机体系下的测量协方差
+    // J_R 为旋转对点的雅可比矩阵 (-point_crossmat), ∑rot 为姿态协方差, ∑t 为位置（平移）协方差
+    // 如何推导？
+    // 因为p_w = R * p_b + t，所以对p_b的协方差进行旋转变换，并叠加姿态和位置的不确定性
+    // 姿态有一个很小的扰动 Rexp(δθ^)，其中 δθ ~ N(0, ∑rot)，δθ^ 为 δθ 的反对称矩阵形式
+    // 对point 的影响大致 δp ≈ -[p]x * δθ
+    // 所以 Jacobian   J_R = -[p]x  于是 ∑p_R = [p]x * ∑rot * [p]x^T
     var = (state_.rot_end * extR_) * var * (state_.rot_end * extR_).transpose() +
           (-point_crossmat) * state_.cov.block<3, 3>(0, 0) * (-point_crossmat).transpose() + state_.cov.block<3, 3>(3, 3);
     pv.var = var;
     input_points.push_back(pv);
   }
-
+  // 逐点哈希定位根体素并插入
   uint plsize = input_points.size();
   for (uint i = 0; i < plsize; i++)
   {
@@ -562,28 +621,34 @@ void VoxelMapManager::BuildVoxelMap()
     for (int j = 0; j < 3; j++)
     {
       loc_xyz[j] = p_v.point_w[j] / voxel_size;
+      // 负坐标向负无穷取整，避免 -0.5 -> 0 的边界错位
+      // 为什么负数要专门减 1？ 其实是为了近似实现向下取整 floor(x/s)，防止点恰好落在体素边界时被分错格子
+      // 因为在 C++ 中，整数类型的强制转换会向零取整，而我们希望负坐标向负无穷取整。
+      // 例如 -0.5 / voxel_size 会得到 -0.5，强制转换为 int64_t 会得到 0，这会导致边界错位。
+      // 所以对于负数，需要减 1，使其向负无穷取整。
       if (loc_xyz[j] < 0) { loc_xyz[j] -= 1.0; }
     }
     VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);
     auto iter = voxel_map_.find(position);
-    if (iter != voxel_map_.end())
+    if (iter != voxel_map_.end()) // 如果根体素已经存在于地图中, 则将新的点加入该体素的临时点云中
     {
       voxel_map_[position]->temp_points_.push_back(p_v);
       voxel_map_[position]->new_points_++;
     }
-    else
+    else // 根体素不存在，则新建八叉树根节点 VoxelOctoTree（第 0 层）
     {
       VoxelOctoTree *octo_tree = new VoxelOctoTree(max_layer, 0, layer_init_num[0], max_points_num, planer_threshold);
       voxel_map_[position] = octo_tree;
-      voxel_map_[position]->quater_length_ = voxel_size / 4;
-      voxel_map_[position]->voxel_center_[0] = (0.5 + position.x) * voxel_size;
-      voxel_map_[position]->voxel_center_[1] = (0.5 + position.y) * voxel_size;
-      voxel_map_[position]->voxel_center_[2] = (0.5 + position.z) * voxel_size;
+      voxel_map_[position]->quater_length_ = voxel_size / 4; // 八叉树节点的四分之一边长(八叉树子节点步长)
+      voxel_map_[position]->voxel_center_[0] = (0.5 + position.x) * voxel_size; // 根体素中心坐标
+      voxel_map_[position]->voxel_center_[1] = (0.5 + position.y) * voxel_size; // 根体素中心坐标
+      voxel_map_[position]->voxel_center_[2] = (0.5 + position.z) * voxel_size; // 根体素中心坐标
       voxel_map_[position]->temp_points_.push_back(p_v);
       voxel_map_[position]->new_points_++;
-      voxel_map_[position]->layer_init_num_ = layer_init_num;
+      voxel_map_[position]->layer_init_num_ = layer_init_num; // 让子节点能继承各层初始化阈值
     }
   }
+  // 遍历整个地图，触发树的构建/划分
   for (auto iter = voxel_map_.begin(); iter != voxel_map_.end(); ++iter)
   {
     iter->second->init_octo_tree();
