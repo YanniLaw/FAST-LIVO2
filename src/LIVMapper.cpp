@@ -370,7 +370,7 @@ void LIVMapper::handleLIO()
 
   double t1 = omp_get_wtime();
   // ESIKF 状态估计
-  voxelmap_manager->StateEstimation(state_propagat);
+  voxelmap_manager->StateEstimation(state_propagat); // state_propagat在前面processImu 进行了状态传播 并赋值
   _state = voxelmap_manager->state_;
   _pv_list = voxelmap_manager->pv_list_;
 

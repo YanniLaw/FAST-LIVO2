@@ -369,6 +369,11 @@ VoxelOctoTree *VoxelOctoTree::Insert(const pointWithVar &pv)
   return nullptr;
 }
 
+/**
+ * @brief 把「IMU 传播得到的预测状态」和「当前帧激光点云与体素地图的点到面残差」做一次 迭代误差状态卡尔曼滤波（ESIKF / iterated EKF），输出修正后的位姿与协方差。
+ * 
+ * @param state_propagat 由 processImu() 完成 IMU 预积分/传播后的预测状态，作为迭代的「先验锚点」
+ */
 void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
 {
   cross_mat_list_.clear();
@@ -379,16 +384,18 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
   // build_residual_time = 0.0;
   // ekf_time = 0.0;
   // double t0 = omp_get_wtime();
-
+  // 1. 预计算点的协方差和反对称矩阵
   for (size_t i = 0; i < feats_down_body_->size(); i++)
   {
     V3D point_this(feats_down_body_->points[i].x, feats_down_body_->points[i].y, feats_down_body_->points[i].z);
     if (point_this[2] == 0) { point_this[2] = 0.001; }
     M3D var;
+    // calcBodyCov 把每个激光点建模为高斯分布 p ~ N(p, ∑_lidar)，其中 ∑_lidar 由激光测距误差和光束方向误差决定
     calcBodyCov(point_this, config_setting_.dept_err_, config_setting_.beam_err_, var);
     body_cov_list_.push_back(var);
     point_this = extR_ * point_this + extT_;
     M3D point_crossmat;
+    // cross_mat_list_ 保存 IMU 系下点的反对称矩阵, 用于计算雅可比，也可用于后续协方差传播(姿态扰动对点的影响)以及地图更新
     point_crossmat << SKEW_SYM_MATRX(point_this);
     cross_mat_list_.push_back(point_crossmat);
   }
@@ -403,13 +410,18 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
   I_STATE.setIdentity();
 
   bool flg_EKF_inited, flg_EKF_converged, EKF_stop_flg = 0;
+  // 2. 主循环：迭代 ESIKF
+  // 每轮迭代都用最新的 state_.rot_end / pos_end 重新投影，这就是「迭代」的意义
   for (int iterCount = 0; iterCount < config_setting_.max_iterations_; iterCount++)
   {
     double total_residual = 0.0;
+    // 2.1 重投影 + 点协方差传播
+    // 将当前帧激光点云从机体坐标系转换到世界坐标系
     pcl::PointCloud<pcl::PointXYZI>::Ptr world_lidar(new pcl::PointCloud<pcl::PointXYZI>);
     TransformLidar(state_.rot_end, state_.pos_end, feats_down_body_, world_lidar);
     M3D rot_var = state_.cov.block<3, 3>(0, 0);
     M3D t_var = state_.cov.block<3, 3>(3, 3);
+    // 把点的不确定性完整传播到世界系
     for (size_t i = 0; i < feats_down_body_->size(); i++)
     {
       pointWithVar &pv = pv_list_[i];
@@ -418,18 +430,23 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
 
       M3D cov = body_cov_list_[i];
       M3D point_crossmat = cross_mat_list_[i];
+      // 计算世界系下点的协方差，考虑了机体系点的协方差、姿态扰动对点的影响以及平移扰动的影响
+      // ∑p_w = R * ∑_lidar * R^T + (-[p]_x) * ∑_rot * (-[p]_x)^T + ∑_t
+      // 第一项: 机体测量的不确定性通过旋转传播到世界系
+      // 第二项: 姿态扰动对点的影响
+      // 第三项: 平移扰动的影响
       cov = state_.rot_end * cov * state_.rot_end.transpose() + (-point_crossmat) * rot_var * (-point_crossmat.transpose()) + t_var;
       pv.var = cov;
-      pv.body_var = body_cov_list_[i];
+      pv.body_var = body_cov_list_[i];  // 保留机体系原始协方差，用于后面残差的量测噪声
     }
     ptpl_list_.clear();
 
     // double t1 = omp_get_wtime();
-
+    // 2.2 建立点到面残差
     BuildResidualListOMP(pv_list_, ptpl_list_);
 
     // build_residual_time += omp_get_wtime() - t1;
-
+    // 输出的 ptpl_list_ 是有效点到面约束
     for (int i = 0; i < ptpl_list_.size(); i++)
     {
       total_residual += fabs(ptpl_list_[i].dis_to_plane_);
@@ -437,7 +454,7 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     effct_feat_num_ = ptpl_list_.size();
     cout << "[ LIO ] Raw feature num: " << feats_undistort_->size() << ", downsampled feature num:" << feats_down_size_ 
          << " effective feature num: " << effct_feat_num_ << " average residual: " << total_residual / effct_feat_num_ << endl;
-
+    // 2.3 构建量测雅可比与残差
     /*** Computation of Measuremnt Jacobian matrix H and measurents covarience
      * ***/
     MatrixXd Hsub(effct_feat_num_, 6);
@@ -490,6 +507,7 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
           ptpl_list_[i].normal_[1] * R_inv(i), ptpl_list_[i].normal_[2] * R_inv(i);
       meas_vec(i) = -ptpl_list_[i].dis_to_plane_;
     }
+    // 2.4 迭代卡尔曼更新
     EKF_stop_flg = false;
     flg_EKF_converged = false;
     /*** Iterative Kalman Filter Update ***/
@@ -508,6 +526,7 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     state_ += solution;
     auto rot_add = solution.block<3, 1>(0, 0);
     auto t_add = solution.block<3, 1>(3, 0);
+    // 2.5 收敛判断 / Rematch
     if ((rot_add.norm() * 57.3 < 0.01) && (t_add.norm() * 100 < 0.015)) { flg_EKF_converged = true; }
     V3D euler_cur = state_.rot_end.eulerAngles(2, 1, 0);
 
@@ -516,6 +535,7 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     if (flg_EKF_converged || ((rematch_num == 0) && (iterCount == (config_setting_.max_iterations_ - 2)))) { rematch_num++; }
 
     /*** Convergence Judgements and Covariance Update ***/
+    // 2.6 协方差更新与收尾
     if (!EKF_stop_flg && (rematch_num >= 2 || (iterCount == config_setting_.max_iterations_ - 1)))
     {
       /*** Covariance Update ***/
@@ -705,6 +725,12 @@ void VoxelMapManager::UpdateVoxelMap(const std::vector<pointWithVar> &input_poin
   }
 }
 
+/**
+ * @brief 建立点到面残差
+ * 
+ * @param pv_list 
+ * @param ptpl_list 
+ */
 void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, std::vector<PointToPlane> &ptpl_list)
 {
   int max_layer = config_setting_.max_layer_;
