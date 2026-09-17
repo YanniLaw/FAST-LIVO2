@@ -410,14 +410,15 @@ void LIVMapper::handleLIO()
   euler_cur = RotMtoEuler(_state.rot_end);
   geoQuat = tf::createQuaternionMsgFromRollPitchYaw(euler_cur(0), euler_cur(1), euler_cur(2));
   publish_odometry(pubOdomAftMapped);
-
+  ///  LIO 更新完 EKF 状态后，把降采样点云重新变换到世界系，并为每个点做"不确定性传播"，再喂给体素地图做更新
   double t3 = omp_get_wtime();
   // 转到更新后的世界坐标系
   PointCloudXYZI::Ptr world_lidar(new PointCloudXYZI());
   transformLidar(_state.rot_end, _state.pos_end, feats_down_body, world_lidar);
-  // 地图更新：重投影 + 点不确定性传播
+  // 点不确定性传播
   for (size_t i = 0; i < world_lidar->points.size(); i++) 
   {
+    // 写入更新后的世界坐标系下的点位置
     voxelmap_manager->pv_list_[i].point_w << world_lidar->points[i].x, world_lidar->points[i].y, world_lidar->points[i].z;
     M3D point_crossmat = voxelmap_manager->cross_mat_list_[i];
     M3D var = voxelmap_manager->body_cov_list_[i];
@@ -425,6 +426,7 @@ void LIVMapper::handleLIO()
           (-point_crossmat) * _state.cov.block<3, 3>(0, 0) * (-point_crossmat).transpose() + _state.cov.block<3, 3>(3, 3);
     voxelmap_manager->pv_list_[i].var = var;
   }
+  // 地图更新
   voxelmap_manager->UpdateVoxelMap(voxelmap_manager->pv_list_);
   std::cout << "[ LIO ] Update Voxel Map" << std::endl;
   _pv_list = voxelmap_manager->pv_list_;
@@ -449,6 +451,7 @@ void LIVMapper::handleLIO()
   publish_frame_world(pubLaserCloudFullRes, vio_manager);
   if (pub_effect_point_en) publish_effect_world(pubLaserCloudEffect, voxelmap_manager->ptpl_list_);
   if (voxelmap_manager->config_setting_.is_pub_plane_map_) voxelmap_manager->pubVoxelMap();
+  // 发布路径和MAVROS位姿信息
   publish_path(pubPath);
   publish_mavros(mavros_pose_publisher);
 
@@ -1214,11 +1217,12 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
   PointCloudXYZRGB::Ptr laserCloudWorldRGB(new PointCloudXYZRGB());
   static int pub_num = 1;
   pub_num++;
-
+  // 如果是VIO模式，累积点云并根据发布频率决定是否发布
+  // 只有 VIO 帧才做上色，因为只有这时才有配套的相机图像
   if (LidarMeasures.lio_vio_flg == VIO)
   {
-    *pcl_wait_pub += *pcl_w_wait_pub;
-    if(pub_num >= pub_scan_num)
+    *pcl_wait_pub += *pcl_w_wait_pub; // 累积世界系点云
+    if(pub_num >= pub_scan_num) // 允许把多帧点云攒在一起再发布一次（减少发布频率)
     {
       pub_num = 1;
       size_t size = pcl_wait_pub->points.size();
@@ -1227,17 +1231,20 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
       cv::Mat img_rgb = vio_manager->img_rgb;
       for (size_t i = 0; i < size; i++)
       {
-        PointTypeRGB pointRGB;
+        PointTypeRGB pointRGB; // 点云着色
         pointRGB.x = pcl_wait_pub->points[i].x;
         pointRGB.y = pcl_wait_pub->points[i].y;
         pointRGB.z = pcl_wait_pub->points[i].z;
 
         V3D p_w(pcl_wait_pub->points[i].x, pcl_wait_pub->points[i].y, pcl_wait_pub->points[i].z);
-        V3D pf(vio_manager->new_frame_->w2f(p_w)); if (pf[2] < 0) continue;
+        // 世界系 → 相机系
+        V3D pf(vio_manager->new_frame_->w2f(p_w)); if (pf[2] < 0) continue; // 在相机后方，跳过
+        // 投影到像素坐标
         V2D pc(vio_manager->new_frame_->w2c(p_w));
-
+        // 像素在图像范围内
         if (vio_manager->new_frame_->cam_->isInFrame(pc.cast<int>(), 3)) // 100
         {
+          // 取该像素双线性插值颜色 → 赋给 pointRGB.r/g/b
           V3F pixel = vio_manager->getInterpolatedPixel(img_rgb, pc);
           pointRGB.r = pixel[2];
           pointRGB.g = pixel[1];
@@ -1253,6 +1260,7 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
   }
 
   /*** Publish Frame ***/
+  // 根据当前 SLAM 模式和状态选择发布带颜色的点云还是普通强度点云
   sensor_msgs::PointCloud2 laserCloudmsg;
   if (slam_mode_ == LIVO && LidarMeasures.lio_vio_flg == VIO)
   {
@@ -1302,7 +1310,7 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
           int size = feats_undistort->points.size();
           PointCloudXYZI::Ptr laserCloudBody(new PointCloudXYZI(size, 1));
           for (int i = 0; i < size; i++)
-          {
+          { // 将点云从激光雷达坐标系转换到IMU坐标系
             RGBpointBodyLidarToIMU(&feats_undistort->points[i], &laserCloudBody->points[i]);
           }
           *pcl_wait_save_intensity += *laserCloudBody;

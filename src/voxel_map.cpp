@@ -168,7 +168,7 @@ void VoxelOctoTree::init_plane(const std::vector<pointWithVar> &points, VoxelPla
 // 它负责决定当前这个 voxel 节点，是“直接作为平面叶子节点使用”，还是“继续切成 8 个子 voxel”
 void VoxelOctoTree::init_octo_tree()
 {
-  // 如果积累的点数超过阈值，则尝试拟合平面
+  // 如果积累的点数超过阈值，则尝试拟合平面(一般这个阈值比冻结平面的阈值小很多)
   if (temp_points_.size() > points_size_threshold_)
   {
     init_plane(temp_points_, plane_ptr_);
@@ -250,26 +250,34 @@ void VoxelOctoTree::cut_octo_tree()
   }
 }
 
+/**
+ * @brief 更新八叉树节点，将新的点加入到体素地图中（递归地插入到对应的子节点或更新当前节点的平面信息）
+ *        这是 LIO 每帧结束后对体素地图进行增量更新的核心函数
+ * 
+ * @param pv 输入的点结构体（带方差），用于更新体素地图
+ */
 void VoxelOctoTree::UpdateOctoTree(const pointWithVar &pv)
 {
-  if (!init_octo_)
+  if (!init_octo_)  // 情形①：节点还没初始化过
   {
     new_points_++;
     temp_points_.push_back(pv);
+    // 待积累足够的点数后再初始化八叉树节点(计算平面参数等等)
     if (temp_points_.size() > points_size_threshold_) { init_octo_tree(); }
   }
-  else
+  else  // 节点已经初始化过
   {
-    if (plane_ptr_->is_plane_)
+    if (plane_ptr_->is_plane_) // 情形②：节点已经是一个平面叶子(根体素节点)
     {
-      if (update_enable_)
+      if (update_enable_) // 还未冻结该平面叶子，允许更新
       {
-        new_points_++;
-        temp_points_.push_back(pv);
+        new_points_++; // 该轮新增的点数
+        temp_points_.push_back(pv); // 节点内总点数
         if (new_points_ > update_size_threshold_)
         {
-          init_plane(temp_points_, plane_ptr_);
-          new_points_ = 0;
+          // 增量式刷新平面估计(利用已积累的所有点)，让平面随新观测更准
+          init_plane(temp_points_, plane_ptr_); // 重新拟合平面参数和协方差
+          new_points_ = 0; // 增量更新平面参数后，重置新点计数
         }
         if (temp_points_.size() >= max_points_num_)
         {
@@ -279,10 +287,11 @@ void VoxelOctoTree::UpdateOctoTree(const pointWithVar &pv)
         }
       }
     }
-    else
-    {
-      if (layer_ < max_layer_)
+    else // 情形③/④：节点已初始化但不是平面（内部节点）
+    { // 这种情况下根体素节点已经不是平面，需要将点插入到对应的子节点中
+      if (layer_ < max_layer_) // 当前层还未达到最大层，可以继续生成子节点
       {
+        // 根据点相对 voxel_center_ 的位置算出所属子象限 leafnum（0~7）
         int xyz[3] = {0, 0, 0};
         if (pv.point_w[0] > voxel_center_[0]) { xyz[0] = 1; }
         if (pv.point_w[1] > voxel_center_[1]) { xyz[1] = 1; }
@@ -300,9 +309,9 @@ void VoxelOctoTree::UpdateOctoTree(const pointWithVar &pv)
           leaves_[leafnum]->UpdateOctoTree(pv);
         }
       }
-      else
+      else // 当前已经是最大层了
       {
-        if (update_enable_)
+        if (update_enable_) // 还允许更新该最大层的节点
         {
           new_points_++;
           temp_points_.push_back(pv);
@@ -457,26 +466,33 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     // 2.3 构建量测雅可比与残差
     /*** Computation of Measuremnt Jacobian matrix H and measurents covarience
      * ***/
-    MatrixXd Hsub(effct_feat_num_, 6);
-    MatrixXd Hsub_T_R_inv(6, effct_feat_num_);
-    VectorXd R_inv(effct_feat_num_);
-    VectorXd meas_vec(effct_feat_num_);
+    // 为什么这里雅可比只有6列？
+    // 这是因为点到面的残差只依赖位姿(R, t): 
+    // 即 r = n^T * (R * p_imu + t - c)
+    // 速度、零偏、重力、曝光时间都不直接出现。他们只能通过协方差P的先验项间接被更新
+    // 这正式LIO的工作方式: IMU传播负责把信息再这些维度之间建立相关性
+    MatrixXd Hsub(effct_feat_num_, 6);          // N×6： 每条残差对 (δθ, δt) 的雅可比
+    MatrixXd Hsub_T_R_inv(6, effct_feat_num_);  // 6×N： Hᵀ R⁻¹（R 为对角，故存成向量乘）
+    VectorXd R_inv(effct_feat_num_);            // N： 每条残差的 1/σ²
+    VectorXd meas_vec(effct_feat_num_);         // N： 新息 z − h(x)
     meas_vec.setZero();
+    // 逐条残差构建
     for (int i = 0; i < effct_feat_num_; i++)
     {
       auto &ptpl = ptpl_list_[i];
       V3D point_this(ptpl.point_b_);
-      point_this = extR_ * point_this + extT_;
+      point_this = extR_ * point_this + extT_; // LiDAR 系 → IMU/body 系
       V3D point_body(ptpl.point_b_);
       M3D point_crossmat;
-      point_crossmat << SKEW_SYM_MATRX(point_this);
+      point_crossmat << SKEW_SYM_MATRX(point_this); // [p_imu]_×
 
       /*** get the normal vector of closest surface/corner ***/
-
+      // 注意这里用的是state_propagat
+      // 用先验状态算残差方差
       V3D point_world = state_propagat.rot_end * point_this + state_propagat.pos_end;
       Eigen::Matrix<double, 1, 6> J_nq;
-      J_nq.block<1, 3>(0, 0) = point_world - ptpl_list_[i].center_;
-      J_nq.block<1, 3>(0, 3) = -ptpl_list_[i].normal_;
+      J_nq.block<1, 3>(0, 0) = point_world - ptpl_list_[i].center_; // ∂dis/∂n
+      J_nq.block<1, 3>(0, 3) = -ptpl_list_[i].normal_;  // ∂dis/∂c
 
       M3D var;
       // V3D normal_b = state_.rot_end.inverse() * ptpl_list_[i].normal_;
@@ -493,14 +509,34 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
       //       state_propagat.cov.block<3, 3>(3, 3) - point_crossmat * state_propagat.cov.block<3, 3>(0, 0) * point_crossmat;
 
       // point_body cov
+      // 这里var只用了body_cov_(传感器噪声)经R_wbR_bl旋转到世界系，没有叠加state_propagat.cov 的姿态/位置项（那些行被注释掉了）。
+      // 这是刻意的：状态不确定度已经通过P进入了卡尔曼增益，若再加进R就会重复计算，导致滤波不合理。
+      // 注意: 这里用的是 state_propagat（IMU 先验），而下面算 A 用的是 state_（当前迭代值）。
+      // 两处评价点不同，属实现上的小不一致
       var = state_propagat.rot_end * extR_ * ptpl_list_[i].body_cov_ * (state_propagat.rot_end * extR_).transpose();
 
       double sigma_l = J_nq * ptpl_list_[i].plane_var_ * J_nq.transpose();
-
+      // 测量方差R 由三部分组成
+      // σ_i^2 = 0.001 + J_nq * Σ_π * J_nq^T + n^T * Σ_p * n
+      // 其中：
+      // 1. 0.001 是一个固定的小量(下限)，对应σ_min ≈ 3.2 cm，防止除零，同时给每条残差的最大权重设了上限
+      // 2. J_nq * Σ_π * J_nq^T 对应平面参数的不确定性贡献
+      // 3. n^T * Σ_p * n 对应点位置不确定性贡献，即点测量噪声投影到法向量方向上的方差
       R_inv(i) = 1.0 / (0.001 + sigma_l + ptpl_list_[i].normal_.transpose() * var * ptpl_list_[i].normal_);
       // R_inv(i) = 1.0 / (sigma_l + ptpl_list_[i].normal_.transpose() * var * ptpl_list_[i].normal_);
 
       /*** calculate the Measuremnt Jacobian matrix H ***/
+      // 测量雅可比矩阵 H 的计算
+      // 由R‘ = R Exp(δθ^) 可得
+      // R' p_imu = R p_imu - R [p_imu]x δθ
+      // ==> ∂dis / ∂(δθ) =  [p_imu]x R^T n = A , ∂dis / ∂(δt) = n
+      // Hi = [A^T, n^T] ∈ R^(1x6)
+      // ------ 
+      // 测量模型取 zi=0（点应落在平面上），故新息: 
+      // zi - hi(x) = 0 - dis = meas_vec(i) = - dis_to_plane_
+      // 符号自洽性检查：若 dis>0（点在 +n 侧），则 meas_vec <0，更新量 ∝H^⊤(z−h)=−dis[A;n]，
+      // 代入后 Δdis∝−dis∥H∥^2<0，即点被拉回平面。✓ 是下降方向。
+      // Hsub_T_R_inv 就是把H^T R^-1按列存下来(R对角，所以逐元素乘)
       V3D A(point_crossmat * state_.rot_end.transpose() * ptpl_list_[i].normal_);
       Hsub.row(i) << VEC_FROM_ARRAY(A), ptpl_list_[i].normal_[0], ptpl_list_[i].normal_[1], ptpl_list_[i].normal_[2];
       Hsub_T_R_inv.col(i) << A[0] * R_inv(i), A[1] * R_inv(i), A[2] * R_inv(i), ptpl_list_[i].normal_[0] * R_inv(i),
@@ -511,6 +547,8 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     EKF_stop_flg = false;
     flg_EKF_converged = false;
     /*** Iterative Kalman Filter Update ***/
+    // MAP + Gauss–Newton
+    // 通过迭代卡尔曼滤波更新状态向量，使得测量残差最小化，即在高斯-牛顿框架下求解最大后验估计(MAP)
     MatrixXd K(DIM_STATE, effct_feat_num_);
     // auto &&Hsub_T = Hsub.transpose();
     auto &&HTz = Hsub_T_R_inv * meas_vec;
@@ -536,10 +574,12 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
 
     /*** Convergence Judgements and Covariance Update ***/
     // 2.6 协方差更新与收尾
+    // 触发条件: 连续两次收敛 或 最后一轮
     if (!EKF_stop_flg && (rematch_num >= 2 || (iterCount == config_setting_.max_iterations_ - 1)))
     {
       /*** Covariance Update ***/
       // _state.cov = (I_STATE - G) * _state.cov;
+      // G只有前6列有非零值，对应状态向量的旋转和平移部分，(I-G)P实际上只改动P的前六列(其余列保持原值)
       state_.cov.block<DIM_STATE, DIM_STATE>(0, 0) =
           (I_STATE.block<DIM_STATE, DIM_STATE>(0, 0) - G.block<DIM_STATE, DIM_STATE>(0, 0)) * state_.cov.block<DIM_STATE, DIM_STATE>(0, 0);
       // total_distance += (_state.pos_end - position_last).norm();
@@ -691,6 +731,11 @@ V3F VoxelMapManager::RGBFromVoxel(const V3D &input_point)
   return RGB;
 }
 
+/**
+ * @brief 更新体素地图，将新的点云信息加入对应的八叉树中
+ * 把一批新的世界系点（带方差）逐点插入/更新到已有的体素地图中，是 LIO 每帧结束后"增量维护地图"的入口函数
+ * @param input_points 
+ */
 void VoxelMapManager::UpdateVoxelMap(const std::vector<pointWithVar> &input_points)
 {
   float voxel_size = config_setting_.max_voxel_size_;
@@ -702,6 +747,8 @@ void VoxelMapManager::UpdateVoxelMap(const std::vector<pointWithVar> &input_poin
   for (uint i = 0; i < plsize; i++)
   {
     const pointWithVar p_v = input_points[i];
+    // 1. 根据点的世界坐标计算它所在的根体素(voxel)哈希位置
+    //    对负坐标做 -1 修正，保证 floor 语义正确
     float loc_xyz[3];
     for (int j = 0; j < 3; j++)
     {
@@ -710,9 +757,10 @@ void VoxelMapManager::UpdateVoxelMap(const std::vector<pointWithVar> &input_poin
     }
     VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);
     auto iter = voxel_map_.find(position);
+    // 如果该根体素已经存在于地图中，则将点交给已有八叉树递归更新
     if (iter != voxel_map_.end()) { voxel_map_[position]->UpdateOctoTree(p_v); }
-    else
-    {
+    else  // 不存在则新建一个根节点 VoxelOctoTree(第0层)，设置体素中心/边长等
+    {     // 然后同样调用 UpdateOctoTree(p_v) 把这个点插进去
       VoxelOctoTree *octo_tree = new VoxelOctoTree(max_layer, 0, layer_init_num[0], max_points_num, planer_threshold);
       voxel_map_[position] = octo_tree;
       voxel_map_[position]->layer_init_num_ = layer_init_num;
@@ -727,9 +775,10 @@ void VoxelMapManager::UpdateVoxelMap(const std::vector<pointWithVar> &input_poin
 
 /**
  * @brief 建立点到面残差
- * 
- * @param pv_list 
- * @param ptpl_list 
+ * 对当前帧每个降采样后的世界系点，在体素地图里找到它所属的那个平面，算出一条点到面残差 PointToPlane，
+ * 把所有成功匹配的残差收集起来交给 EKF。整个过程用 OpenMP 并行。
+ * @param pv_list 当前帧降采样点，已变换到世界系
+ * @param ptpl_list 点到面残差列表，函数会将所有成功匹配的残差存入该列表
  */
 void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, std::vector<PointToPlane> &ptpl_list)
 {
@@ -750,25 +799,28 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
     omp_set_num_threads(MP_PROC_NUM);
     #pragma omp parallel for
   #endif
-  for (int i = 0; i < index.size(); i++)
+  for (int i = 0; i < index.size(); i++) // 按点并行 + 邻域回退
   {
     pointWithVar &pv = pv_list[i];
     float loc_xyz[3];
     for (int j = 0; j < 3; j++)
     {
       loc_xyz[j] = pv.point_w[j] / voxel_size;
-      if (loc_xyz[j] < 0) { loc_xyz[j] -= 1.0; }
+      if (loc_xyz[j] < 0) { loc_xyz[j] -= 1.0; } // 负数向下取整
     }
+    // 和 BuildVoxelMap 里完全一致的哈希定位
     VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);
     auto iter = voxel_map_.find(position);
     if (iter != voxel_map_.end())
     {
-      VoxelOctoTree *current_octo = iter->second;
+      VoxelOctoTree *current_octo = iter->second; // 根体素节点
       PointToPlane single_ptpl;
       bool is_sucess = false;
       double prob = 0;
+      // 第一次尝试：在自己所在的根体素里找平面
+      // 单点、单树、递归匹配
       build_single_residual(pv, current_octo, 0, is_sucess, prob, single_ptpl);
-      if (!is_sucess)
+      if (!is_sucess) // 失败回退：尝试相邻根体素
       {
         VOXEL_LOCATION near_position = position;
         if (loc_xyz[0] > (current_octo->voxel_center_[0] + current_octo->quater_length_)) { near_position.x = near_position.x + 1; }
@@ -782,7 +834,7 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
       }
       if (is_sucess)
       {
-        mylock.lock();
+        mylock.lock(); // 上锁，保护共享资源
         useful_ptpl[i] = true;
         all_ptpl_list[i] = single_ptpl;
         mylock.unlock();
@@ -795,12 +847,24 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
       }
     }
   }
+  // 串行压缩: 将所有有效的点到平面残差压缩到最终的列表中
   for (size_t i = 0; i < useful_ptpl.size(); i++)
   {
     if (useful_ptpl[i]) { ptpl_list.push_back(all_ptpl_list[i]); }
   }
 }
 
+/**
+ * @brief 构建单个点到平面的残差，用于计算点到平面的距离并判断是否符合平面约束
+ * 给定一个世界系点，沿八叉树递归下探；一旦遇到"平面"节点，就用几何门限 + 概率门限判断这个点能不能落在该平面上，
+ * 并算出残差。整棵树走完后，保留概率最高的那个匹配。
+ * @param pv 待匹配的点及其协方差
+ * @param current_octo 当前八叉树节点
+ * @param current_layer 当前八叉树层数
+ * @param is_sucess 是否成功匹配到平面
+ * @param prob 最高匹配的概率
+ * @param single_ptpl 单个点到平面的残差结构体(最优匹配的残差)
+ */
 void VoxelMapManager::build_single_residual(pointWithVar &pv, const VoxelOctoTree *current_octo, const int current_layer, bool &is_sucess,
                                             double &prob, PointToPlane &single_ptpl)
 {
@@ -809,28 +873,74 @@ void VoxelMapManager::build_single_residual(pointWithVar &pv, const VoxelOctoTre
 
   double radius_k = 3;
   Eigen::Vector3d p_w = pv.point_w;
+  // ── 情形 A：当前节点是平面 ──
+  //    A1. 面内距离门限
+  //    A2. 不确定度(σ)门限
+  //    A3. 概率打分，择优替换 single_ptpl
+  ///  三重门限：面内距离门限 + 不确定度(σ)门限 + 概率打分
+  // 1. 面内距离门限: 点投影要在平面片范围内
+  // 2. 不确定度(σ)门限: 残差要在联合不确定度的 3σ 内
+  // 3. 概率打分: 全树取概率最大者
   if (current_octo->plane_ptr_->is_plane_)
   {
     VoxelPlane &plane = *current_octo->plane_ptr_;
     Eigen::Vector3d p_world_to_center = p_w - plane.center_;
+    // 点到平面的“法向”距离
     float dis_to_plane = fabs(plane.normal_(0) * p_w(0) + plane.normal_(1) * p_w(1) + plane.normal_(2) * p_w(2) + plane.d_);
+    // 点到平面中心的距离平方
     float dis_to_center = (plane.center_(0) - p_w(0)) * (plane.center_(0) - p_w(0)) + (plane.center_(1) - p_w(1)) * (plane.center_(1) - p_w(1)) +
                           (plane.center_(2) - p_w(2)) * (plane.center_(2) - p_w(2));
+    // 面内（切向）距离
     float range_dis = sqrt(dis_to_center - dis_to_plane * dis_to_plane);
-
+    // 几何上是勾股定理
+    // |pc - c|^2 = dis_to_plane^2 + range_dis^2  法向分量  与 切向分量
+    /*
+                 n
+                 ↑c (center of the plane)
+      ─ ─ ─ ─ ─ ─┼─ ─ ─ ─ ─ ─  plane
+                 |\
+   dis_to_plane  | \
+                 |  \  |p_w - c|
+                 |   \
+      ─ ─ ─ ─ ─ ─+----*  p_w
+                 |range_dis
+    含义：即使点在法向上贴着平面，如果它的投影点跑出了这个平面片很远（比如跑到了墙外），也不该把它当成约束。
+    radius_k = 3 是宽容系数（因为 radius_ = sqrt(λ_max) 只是统计尺度，偏小，见前面 radius_ 的分析）
+    若 range_dis 超限 → 直接 return，不进入子节点（平面节点本来也没有子节点）
+*/
     if (range_dis <= radius_k * plane.radius_)
     {
+      //  不确定度（σ）门限
+      // ① 平面参数不确定性
+      // 点到面距离 dis = n^T (p_w - c),对平面参数[n;c] 的一阶泰勒展开
+      // δdis = ∂dis/∂n * δn + ∂dis/∂c * δc
+      //      = [p_w - c, -n] * [δn; δc] = J_nq * [δn; δc]
+      // ====> Var1 = J_nq * ∑_π * J_nq^T 
+      // ② 点自身不确定性
+      // 点的世界系协方差 ∑_p 投影到法向上，得到点到平面的距离不确定性 Var2 = n^T * ∑_p * n
+      // ③ 合成
+      // σ_l = Var1 + Var2 = J_nq * ∑_π * J_nq^T + n^T * ∑_p * n
+      // ===> 检验统计量 = |dis| / sqrt(σ_l) < σ_num
+      // 即：残差必须落在 σ_num倍标准差以内（默认 3σ）
+      // 这就把“拟合得好的平面”(∑_π 小) 和 “点观测精度高”(∑_p 小) 自动纳入门限，是FAST-LIVO2相比普通LOAM的关键优势
       Eigen::Matrix<double, 1, 6> J_nq;
-      J_nq.block<1, 3>(0, 0) = p_w - plane.center_;
-      J_nq.block<1, 3>(0, 3) = -plane.normal_;
-      double sigma_l = J_nq * plane.plane_var_ * J_nq.transpose();
-      sigma_l += plane.normal_.transpose() * pv.var * plane.normal_;
-      if (dis_to_plane < sigma_num * sqrt(sigma_l))
+      J_nq.block<1, 3>(0, 0) = p_w - plane.center_; // ∂dis/∂n
+      J_nq.block<1, 3>(0, 3) = -plane.normal_;      // ∂dis/∂c
+      double sigma_l = J_nq * plane.plane_var_ * J_nq.transpose();   // ① 平面参数不确定性的贡献
+      sigma_l += plane.normal_.transpose() * pv.var * plane.normal_; // ② 点自身不确定性的贡献
+      if (dis_to_plane < sigma_num * sqrt(sigma_l)) // sigma_num 默认 3
       {
         is_sucess = true;
+        //  概率打分与择优
+        // 打分公式就是零均值一维高斯 PDF(省去了1/sqrt(2*pi)常数，只用于比较大小): 
+        // prob = 1/ sqrt(sigma_l) * exp(-dis_to_plane^2 / 2*sigma_l)
+        // dis越小，prob越大(贴合越好)
+        // sigma_l 越小，峰值1/ sqrt(sigma_l) 越高，衰减越快(越"自信")
         double this_prob = 1.0 / (sqrt(sigma_l)) * exp(-0.5 * dis_to_plane * dis_to_plane / sigma_l);
-        if (this_prob > prob)
-        {
+        if (this_prob > prob) // 不是"首次命中即返回"
+        { // 因为情形 B 里父节点会遍历全部 8 个子节点（不提前 break），
+          // 所以整棵树跑完后 single_ptpl 是全树概率最大的那个平面，prob 是它的分数。
+          // 这是一个"八叉树内最大似然选择"。
           prob = this_prob;
           pv.normal = plane.normal_;
           single_ptpl.body_cov_ = pv.body_var;
@@ -842,6 +952,7 @@ void VoxelMapManager::build_single_residual(pointWithVar &pv, const VoxelOctoTre
           single_ptpl.d_ = plane.d_;
           single_ptpl.layer_ = current_layer;
           single_ptpl.dis_to_plane_ = plane.normal_(0) * p_w(0) + plane.normal_(1) * p_w(1) + plane.normal_(2) * p_w(2) + plane.d_;
+          // dis_to_plane_ ← 带符号，用于 EKF
         }
         return;
       }
@@ -857,12 +968,14 @@ void VoxelMapManager::build_single_residual(pointWithVar &pv, const VoxelOctoTre
       return;
     }
   }
-  else
+  else // ── 情形 B：当前节点不是平面 ──
   {
+    // 非平面且未到最大层 → 遍历 8 个非空子节点递归，把累加器原样传下去。
     if (current_layer < max_layer)
-    {
+    { // 没有提前退出，因此是一棵完整的树遍历（代价上界 8^depth，但 max_layer_ 默认 1，实际最多访问 8 个节点）
       for (size_t leafnum = 0; leafnum < 8; leafnum++)
-      {
+      { // 未初始化的节点（init_octo_ == false）其 is_plane_ 默认为 false，会走进这个分支，
+        // 但 leaves_ 全为 nullptr，等价于"空转返回"
         if (current_octo->leaves_[leafnum] != nullptr)
         {
 
@@ -872,7 +985,7 @@ void VoxelMapManager::build_single_residual(pointWithVar &pv, const VoxelOctoTre
       }
       return;
     }
-    else { return; }
+    else { return; } // 到最大层还不是平面 → 直接返回，该点在这棵树上匹配失败，放弃
   }
 }
 
@@ -1012,6 +1125,11 @@ void VoxelMapManager::mapJet(double v, double vmin, double vmax, uint8_t &r, uin
   b = (uint8_t)(255 * db);
 }
 
+/**
+ * @brief 地图滑动操作，清理超出当前视野范围的体素节点，
+ * 以机器人当前位置为中心，只保留一个固定范围（half_map_size 个根体素半径）内的地图，
+ * 把超出这个范围的旧体素删除，从而控制内存占用和查找/拟合的计算量，避免地图随轨迹增长无限膨胀
+ */
 void VoxelMapManager::mapSliding()
 {
   if((position_last_ - last_slide_position).norm() < config_setting_.sliding_thresh)
@@ -1025,11 +1143,13 @@ void VoxelMapManager::mapSliding()
   double t_sliding_start = omp_get_wtime();
   float loc_xyz[3];
   for (int j = 0; j < 3; j++)
-  {
+  { // 将机器人当前位置转换为根体素整数坐标
     loc_xyz[j] = position_last_[j] / config_setting_.max_voxel_size_;
     if (loc_xyz[j] < 0) { loc_xyz[j] -= 1.0; }
   }
   // VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);//discrete global
+  // 以当前体素坐标为中心，划出一个 [center - half_map_size, center + half_map_size] 的立方体窗口
+  // 窗口外的根体素全部删除
   clearMemOutOfMap((int64_t)loc_xyz[0] + config_setting_.half_map_size, (int64_t)loc_xyz[0] - config_setting_.half_map_size,
                     (int64_t)loc_xyz[1] + config_setting_.half_map_size, (int64_t)loc_xyz[1] - config_setting_.half_map_size,
                     (int64_t)loc_xyz[2] + config_setting_.half_map_size, (int64_t)loc_xyz[2] - config_setting_.half_map_size);

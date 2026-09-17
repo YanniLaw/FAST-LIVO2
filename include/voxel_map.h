@@ -52,19 +52,20 @@ typedef struct VoxelMapConfig
   int half_map_size;                  // 地图半尺寸
 } VoxelMapConfig;
 
+// 点到平面残差结构体，用于存储点到平面的匹配信息
 typedef struct PointToPlane
 {
-  Eigen::Vector3d point_b_;
-  Eigen::Vector3d point_w_;
-  Eigen::Vector3d normal_;
-  Eigen::Vector3d center_;
-  Eigen::Matrix<double, 6, 6> plane_var_;
-  M3D body_cov_;
-  int layer_;
-  double d_;
-  double eigen_value_;
-  bool is_valid_;
-  float dis_to_plane_;
+  Eigen::Vector3d point_b_; // 点在机体坐标系下的坐标
+  Eigen::Vector3d point_w_; // 点在世界坐标系下的坐标
+  Eigen::Vector3d normal_;  // 法向量
+  Eigen::Vector3d center_;  // 平面中心点
+  Eigen::Matrix<double, 6, 6> plane_var_; // 平面参数的协方差矩阵
+  M3D body_cov_;        // 点在机体坐标系下的协方差矩阵
+  int layer_;           // 八叉树层数
+  double d_;            // 平面方程中的d参数
+  double eigen_value_;  // 特征值
+  bool is_valid_;       // 是否有效
+  float dis_to_plane_;  // 点到平面的距离(带符号，用于 EKF)
 } PointToPlane;
 
 // 体素平面结构体，用于存储体素平面的各种属性
@@ -97,6 +98,7 @@ typedef struct VoxelPlane
   }
 } VoxelPlane;
 
+// 根体素在三维空间中的整数坐标，用于哈希定位体素
 class VOXEL_LOCATION
 {
 public:
