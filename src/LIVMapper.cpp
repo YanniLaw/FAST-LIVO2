@@ -1015,7 +1015,7 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       /*** has img topic, but img topic timestamp larger than lidar end time,
        * process lidar topic. After LIO update, the meas.lidar_frame_end_time
        * will be refresh. ***/
-      // 初始化时，设置上一次LIO更新的时间为激光雷达帧的起始时间
+      // 初始化时，设置上一次LIO更新的时间为激光雷达帧缓存第一帧的起始时间
       if (meas.last_lio_update_time < 0.0) meas.last_lio_update_time = lid_header_time_buffer.front();
       // printf("[ Data Cut ] wait \n");
       // printf("[ Data Cut ] last_lio_update_time: %lf \n",
@@ -1048,6 +1048,8 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       m.imu.clear();
       m.lio_time = img_capture_time; // 设置LIO更新时间为图像捕获时间
       mtx_buffer.lock();
+      // 所以 这里手机的是上一次LIO更新到当前 LIO 时间之间的 IMU 数据
+      // 也就是 last_lio_update_time 到 m.lio_time 之间的 IMU 数据
       while (!imu_buffer.empty()) // 遍历IMU缓冲区，收集在LIO时间之前的IMU数据
       {
         if (imu_buffer.front()->header.stamp.toSec() > m.lio_time) break;
